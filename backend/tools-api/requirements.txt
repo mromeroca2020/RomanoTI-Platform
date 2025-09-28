@@ -1,7 +1,10 @@
 fastapi
 uvicorn
-psutil
 requests
+psutil
+passlib
+python-multipart
 python-jose[cryptography]
-passlib[bcrypt]
+
+
 
