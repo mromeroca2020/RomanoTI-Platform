@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
@@ -341,4 +340,3 @@ def network_portscan(req: PortScanRequest, user=Depends(require_engineer)):
         "ts": datetime.utcnow().isoformat(),
     }
 
->>>>>>> 9907876 (api: PBKDF2 users + deps + endpoints listos para deploy)
