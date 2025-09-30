@@ -1,35 +1,55 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from jose import jwt, JWTError
 from passlib.context import CryptContext
-import os, json, platform, psutil, socket, subprocess, requests, time, concurrent.futures
-from typing import List
-from datetime import datetime, timedelta
 
-# ===== Config =====
-JWT_SECRET = os.getenv("ROMANOTI_JWT_SECRET", "change-me")  # cambia en prod
+import os, json, time, socket, platform, subprocess, psutil
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+# =========================
+# Configuración / Entorno
+# =========================
+JWT_SECRET = os.getenv("ROMANOTI_JWT_SECRET", "change-me")  # ⚠️ cámbialo en prod
 JWT_ALG    = "HS256"
 JWT_HOURS  = int(os.getenv("ROMANOTI_JWT_HOURS", "8"))
-ALLOWED_ORIGINS = json.loads(os.getenv("ROMANOTI_ALLOWED_ORIGINS", '["*"]'))
 
-# ===== Usuarios =====
-PWD = os.path.dirname(__file__)
-USERS_FILE = os.path.join(PWD, "users.json")
-pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")  # PBKDF2
+# CORS
+def _parse_origins(val: str) -> List[str]:
+    try:
+        j = json.loads(val)
+        if isinstance(j, list):
+            return j
+    except Exception:
+        pass
+    if not val:
+        return ["*"]
+    return [x.strip() for x in val.split(",") if x.strip()]
 
-def load_users():
-    if not os.path.exists(USERS_FILE):
-        raise RuntimeError("No existe users.json (crea uno).")
-    with open(USERS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return {u["username"]: u for u in data}
+ALLOWED_ORIGINS = _parse_origins(os.getenv("ROMANOTI_ALLOWED_ORIGINS", "*"))
 
-USERS = load_users()
+# Paths
+PWD        = Path(__file__).resolve().parent
+USERS_FILE = PWD / "users.json"
 
-# ===== App =====
-app = FastAPI(title="RomanoTI Tools API", version="0.4")
+# Agente / Reports
+DATA_DIR     = (PWD / "data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
+REPORTS_FILE = DATA_DIR / "reports.jsonl"
+LATEST_FILE  = DATA_DIR / "latest.json"
+ORG_API_KEY  = os.getenv("ROMANOTI_ORG_API_KEY", "MySecret123$")
+
+# Crypto
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# =========================
+# App
+# =========================
+app = FastAPI(title="RomanoTI Tools API", version="1.0.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -38,185 +58,233 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
+# =========================
+# Modelos
+# =========================
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
 
-# ===== Modelos =====
-class LoginRequest(BaseModel):
+class User(BaseModel):
     username: str
-    password: str
+    roles: List[str] = []
 
 class PingRequest(BaseModel):
-    host: str = "8.8.8.8"
+    host: str
     count: int = 4
 
 class TraceRequest(BaseModel):
-    host: str = "8.8.8.8"
+    host: str
 
 class PortScanRequest(BaseModel):
     host: str
-    ports: List[int] | None = None
-    start: int | None = 1
-    end: int | None = 1024
-    timeout_ms: int = 800
-    max_workers: int = 200
+    start: int = 1
+    end: int = 1024
+    ports: Optional[List[int]] = None
+    timeout_ms: int = 500
 
-# ===== Auth utils =====
-def verify_password(plain: str, hashed: str) -> bool:
-    if not hashed:
-        return False
-    try:
-        if hashed.startswith("$"):              # PBKDF2
-            return pwd_context.verify(plain, hashed)
-        if hashed.startswith("plaintext:"):     # solo DEV
-            return plain == hashed.split(":", 1)[1]
-        return False
-    except Exception:
-        return False
-
-def create_token(username: str, role: str) -> str:
-    payload = {
-        "sub": username,
-        "role": role,
-        "iat": int(datetime.utcnow().timestamp()),
-        "exp": int((datetime.utcnow() + timedelta(hours=JWT_HOURS)).timestamp()),
-        "iss": "romanoti-tools"
+# =========================
+# Utilidades de usuarios
+# =========================
+def load_users() -> Dict[str, Dict[str, Any]]:
+    """
+    Estructura esperada en users.json:
+    {
+      "users": [
+        {"username": "eng1", "password": "$2b$....", "roles": ["engineer"] }
+      ]
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+    - Si 'password' NO es hash bcrypt, se compara en claro (útil para pruebas).
+    """
+    if not USERS_FILE.exists():
+        # fallback mínimo: eng1 / eng1
+        return {"users": [{"username": "eng1", "password": "eng1", "roles": ["engineer"]}]}
+    with USERS_FILE.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-        username, role = payload.get("sub"), payload.get("role")
-        if not username or not role:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user = USERS.get(username)
-        if not user or user.get("role") != role:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        return {"username": username, "role": role}
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid/expired token")
+def verify_password(plain: str, stored: str) -> bool:
+    if stored.startswith("$2a$") or stored.startswith("$2b$") or stored.startswith("$2y$"):
+        # bcrypt
+        return pwd_context.verify(plain, stored)
+    # texto plano (solo dev)
+    return plain == stored
 
-def require_engineer(user=Depends(get_current_user)):
-    if user["role"] != "engineer":
-        raise HTTPException(status_code=403, detail="Insufficient role")
-    return user
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    exp = datetime.utcnow() + (expires_delta or timedelta(hours=JWT_HOURS))
+    to_encode.update({"exp": exp})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALG)
 
-# ===== Helpers =====
-def run_cmd(command: list, timeout: int = 30) -> dict:
-    try:
-        p = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-        return {"ok": p.returncode == 0, "stdout": p.stdout, "stderr": p.stderr}
-    except FileNotFoundError as e:
-        return {"ok": False, "stdout": "", "stderr": f"Comando no encontrado: {e}"}
-    except Exception as e:
-        return {"ok": False, "stdout": "", "stderr": str(e)}
+def authenticate_user(username: str, password: str) -> Optional[User]:
+    data = load_users()
+    for u in data.get("users", []):
+        if u.get("username") == username and verify_password(password, u.get("password","")):
+            return User(username=username, roles=u.get("roles") or [])
+    return None
 
-def _port_is_open(host: str, port: int, timeout: float) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except Exception:
-        return False
+def get_current_user(token: str = Depends(OAuth2PasswordRequestForm)):
+    # Esto no se usa así; dejamos la dependencia abajo en /auth/token
+    pass
 
-# ===== Endpoints =====
+# =========================
+# Endpoints de Auth
+# =========================
+@app.post("/auth/token", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    token = create_access_token({"sub": user.username, "roles": user.roles})
+    return {"access_token": token, "token_type": "bearer"}
+
+# =========================
+# Salud
+# =========================
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "romanoti-tools", "ts": datetime.utcnow().isoformat()}
+    return {"status": "ok", "service": "romanoti-tools", "ts": datetime.utcnow().isoformat()+"Z"}
 
-@app.post("/auth/login")
-def auth_login(req: LoginRequest):
-    user = USERS.get(req.username)
-    if not user or not verify_password(req.password, user.get("password_hash", "")):
-        raise HTTPException(status_code=401, detail="Bad username or password")
-    token = create_token(user["username"], user["role"])
-    return {"access_token": token, "token_type": "bearer", "expires_in": JWT_HOURS * 3600}
-
-@app.post("/auth/token")
-def auth_token(form: OAuth2PasswordRequestForm = Depends()):
-    user = USERS.get(form.username)
-    if not user or not verify_password(form.password, user.get("password_hash", "")):
-        raise HTTPException(status_code=401, detail="Bad username or password")
-    token = create_token(user["username"], user["role"])
-    return {"access_token": token, "token_type": "bearer", "expires_in": JWT_HOURS * 3600}
-
-@app.get("/auth/me")
-def auth_me(user=Depends(require_engineer)):
-    return user
-
+# =========================
+# Info de sistema / red
+# =========================
 @app.get("/system/info")
-def system_info(user=Depends(require_engineer)):
-    return {
-        "os": f"{platform.system()} {platform.release()}",
+def system_info():
+    vm = psutil.virtual_memory()
+    info = {
+        "os": platform.platform(),
         "version": platform.version(),
-        "arch": platform.architecture()[0],
-        "cpu_cores": psutil.cpu_count(),
-        "ram_gb": psutil.virtual_memory().total // (1024**3),
-        "ts": datetime.utcnow().isoformat(),
+        "arch": platform.machine(),
+        "cpu_cores": psutil.cpu_count(logical=True),
+        "ram_gb": round(vm.total / (1024**3), 2),
+        "hostname": socket.gethostname(),
+        "ts": datetime.utcnow().isoformat()+"Z",
     }
+    return info
 
 @app.get("/network/info")
-def network_info(user=Depends(require_engineer)):
-    data = {"timestamp": datetime.utcnow().isoformat()}
+def network_info():
+    addrs = psutil.net_if_addrs()
+    stats = psutil.net_if_stats()
+    interfaces = {}
+    for ifname, lst in addrs.items():
+        ips = []
+        for a in lst:
+            if a.family == socket.AF_INET:
+                ips.append({"ip": a.address, "netmask": a.netmask})
+            elif hasattr(socket, "AF_INET6") and a.family == socket.AF_INET6:
+                ips.append({"ip6": a.address, "netmask": a.netmask})
+        interfaces[ifname] = {
+            "isup": stats.get(ifname).isup if ifname in stats else None,
+            "speed": getattr(stats.get(ifname, None), "speed", None) if ifname in stats else None,
+            "addrs": ips
+        }
+    return {"hostname": socket.gethostname(), "interfaces": interfaces}
+
+# =========================
+# Utilidades de red
+# =========================
+def _run(cmd: List[str], timeout: int = 20) -> str:
     try:
-        data["public_ip"] = requests.get("https://api.ipify.org", timeout=5).text
-        data["internet"] = "CONNECTED"
-    except Exception:
-        data["public_ip"] = None
-        data["internet"] = "OFFLINE"
-    try:
-        hostname = socket.gethostname()
-        data["hostname"] = hostname
-        data["local_ip"] = socket.gethostbyname(hostname)
-    except Exception:
-        data["hostname"] = None
-        data["local_ip"] = None
-    try:
-        ifaces = {}
-        for name, addrs in psutil.net_if_addrs().items():
-            ips = [a.address for a in addrs if getattr(a, "family", None) == socket.AF_INET]
-            if ips:
-                ifaces[name] = ips
-        data["interfaces"] = ifaces
-    except Exception:
-        data["interfaces"] = {}
-    return data
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=timeout)
+        return out.decode(errors="ignore")
+    except subprocess.CalledProcessError as e:
+        return e.output.decode(errors="ignore")
+    except Exception as e:
+        return f"error: {e}"
 
 @app.post("/network/ping")
-def network_ping(req: PingRequest, user=Depends(require_engineer)):
-    param = "-n" if platform.system().lower() == "windows" else "-c"
-    count = str(max(1, min(req.count, 10)))
-    return run_cmd(["ping", param, count, req.host], timeout=25)
+def ping(req: PingRequest):
+    if platform.system().lower().startswith("win"):
+        cmd = ["ping", "-n", str(req.count), req.host]
+    else:
+        cmd = ["ping", "-c", str(req.count), req.host]
+    out = _run(cmd, timeout=30)
+    # devolvemos último bloque para no saturar
+    return {"host": req.host, "count": req.count, "output": out}
 
 @app.post("/network/traceroute")
-def network_traceroute(req: TraceRequest, user=Depends(require_engineer)):
-    tool = "tracert" if platform.system().lower() == "windows" else "traceroute"
-    return run_cmd([tool, req.host], timeout=90)
+def traceroute(req: TraceRequest):
+    if platform.system().lower().startswith("win"):
+        cmd = ["tracert", "-d", "-h", "20", req.host]
+    else:
+        # algunos contenedores no tienen 'traceroute'; si falla, mostramos mensaje
+        cmd = ["traceroute", "-n", "-m", "20", req.host]
+    out = _run(cmd, timeout=60)
+    return {"host": req.host, "output": out}
+
+def _check_port(host: str, port: int, timeout: float) -> Optional[int]:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return port
+    except Exception:
+        return None
 
 @app.post("/network/portscan")
-def network_portscan(req: PortScanRequest, user=Depends(require_engineer)):
-    start = max(1, req.start or 1)
-    end = min(max(start, req.end or 1024), 65535)
-    timeout = max(0.1, (req.timeout_ms or 800) / 1000.0)
-    workers = max(10, min(req.max_workers or 200, 1000))
-    if req.ports and len(req.ports) > 5000:
-        raise HTTPException(status_code=400, detail="Too many ports (max 5000).")
-    ports_to_scan = req.ports if req.ports else list(range(start, end + 1))
-    t0 = time.time()
+def portscan(req: PortScanRequest):
+    ports: List[int]
+    if req.ports and len(req.ports) > 0:
+        ports = sorted(set([int(p) for p in req.ports if 1 <= int(p) <= 65535]))
+    else:
+        s = max(1, int(req.start))
+        e = min(65535, int(req.end))
+        if e < s: s, e = e, s
+        ports = list(range(s, e+1))
+
+    timeout = max(0.05, req.timeout_ms / 1000.0)
     open_ports: List[int] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_port_is_open, req.host, p, timeout): p for p in ports_to_scan}
-        for fut in concurrent.futures.as_completed(futures):
-            p = futures[fut]
-            try:
-                if fut.result():
-                    open_ports.append(p)
-            except Exception:
-                pass
-    open_ports.sort()
-    return {
-        "target": req.host,
-        "scanned": len(ports_to_scan),
-        "open_ports": open_ports,
-        "elapsed_s": round(time.time() - t0, 3),
-        "ts": datetime.utcnow().isoformat(),
+    with ThreadPoolExecutor(max_workers=200) as ex:
+        futures = {ex.submit(_check_port, req.host, p, timeout): p for p in ports}
+        for fu in as_completed(futures):
+            res = fu.result()
+            if res:
+                open_ports.append(res)
+
+    return {"host": req.host, "open": sorted(open_ports), "scanned": len(ports), "timeout_ms": req.timeout_ms}
+
+# =========================
+# Agente On-Prem (LAN)
+# =========================
+@app.post("/client/report")
+async def client_report(
+    request: Request,
+    x_api_key: Optional[str] = Header(None),
+    x_agent: Optional[str] = Header(None),
+):
+    # 1) Auth por API key
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    # 2) JSON libre
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON")
+
+    # 3) Normaliza y persiste
+    record = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "agent": x_agent or payload.get("agent") or "unknown",
+        "data": payload,
     }
+
+    # histórico
+    with REPORTS_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    # último
+    with LATEST_FILE.open("w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False)
+
+    return {"ok": True, "saved": True}
+
+@app.get("/client/reports/latest")
+def client_reports_latest(x_api_key: Optional[str] = Header(None)):
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    if not LATEST_FILE.exists():
+        return {"ok": True, "empty": True, "message": "no reports yet"}
+
+    with LATEST_FILE.open("r", encoding="utf-8") as f:
+        record = json.load(f)
+    return record
