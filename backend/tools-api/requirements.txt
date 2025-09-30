@@ -5,6 +5,8 @@ psutil
 passlib
 python-multipart
 python-jose[cryptography]
+dnspython==2.6.1
+
 
 
 
