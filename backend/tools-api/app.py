@@ -4,7 +4,8 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from jose import jwt, JWTError
 from passlib.context import CryptContext
-
+import ssl
+from dns import resolver, exception as dns_exc  # pip install dnspython
 import os, json, time, socket, platform, subprocess, psutil
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
@@ -148,6 +149,84 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     token = create_access_token({"sub": user.username, "roles": user.roles})
     return {"access_token": token, "token_type": "bearer"}
 
+# ===== External checks =====
+class TlsReq(BaseModel):
+    host: str
+    port: int = 443
+
+class EmailDNSReq(BaseModel):
+    domain: str
+
+def _tls_cert_expiry(host: str, port: int = 443, timeout: int = 5):
+    ctx = ssl.create_default_context()
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            cert = ssock.getpeercert()
+            # 'notAfter' ej: 'Oct 12 23:59:59 2025 GMT'
+            exp_str = cert["notAfter"]
+            exp = datetime.strptime(exp_str, "%b %d %H:%M:%S %Y %Z")
+            days = (exp - datetime.utcnow()).days
+            issuer = ""
+            try:
+                issuer = dict(x[0] for x in cert.get("issuer", [])) \
+                           .get("organizationName", "")
+            except Exception:
+                pass
+            subject = ""
+            try:
+                subject = dict(x[0] for x in cert.get("subject", [])) \
+                           .get("commonName", "")
+            except Exception:
+                pass
+            return {
+                "host": host,
+                "port": port,
+                "subject": subject,
+                "issuer": issuer,
+                "not_after": exp.isoformat() + "Z",
+                "days_remaining": days,
+            }
+
+@app.post("/ext/tls")
+def ext_tls(req: TlsReq):
+    try:
+        return _tls_cert_expiry(req.host, req.port)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/ext/emaildns")
+def email_dns(req: EmailDNSReq):
+    dom = req.domain.strip()
+    if not dom:
+        raise HTTPException(status_code=400, detail="domain required")
+
+    out = {"domain": dom}
+
+    # MX
+    try:
+        answers = resolver.resolve(dom, "MX")
+        out["mx"] = [f"{r.preference} {r.exchange.to_text()}" for r in answers]
+    except (dns_exc.DNSException, Exception) as e:
+        out["mx_error"] = str(e)
+
+    # SPF (TXT en root con 'v=spf1')
+    try:
+        txt = [t.to_text().strip('"') for t in resolver.resolve(dom, "TXT")]
+        out["spf"] = [t for t in txt if t.lower().startswith("v=spf1")]
+    except (dns_exc.DNSException, Exception) as e:
+        out["spf_error"] = str(e)
+
+    # DMARC (TXT en _dmarc.domain con 'v=DMARC1')
+    try:
+        dmarc_txt = [
+            t.to_text().strip('"')
+            for t in resolver.resolve(f"_dmarc.{dom}", "TXT")
+        ]
+        out["dmarc"] = [t for t in dmarc_txt if t.lower().startswith("v=dmarc1")]
+    except (dns_exc.DNSException, Exception) as e:
+        out["dmarc_error"] = str(e)
+
+    return out
 # =========================
 # Salud
 # =========================
