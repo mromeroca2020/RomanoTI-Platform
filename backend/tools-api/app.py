@@ -11,6 +11,9 @@ from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+# 👇 NUEVO: para responder OPTIONS 204 explícitamente
+from starlette.responses import Response
+
 # =========================
 # Configuración / Entorno
 # =========================
@@ -50,13 +53,21 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # =========================
 app = FastAPI(title="RomanoTI Tools API", version="1.0.0")
 
+# 👇 AJUSTADO: CORS permisivo para llamadas desde Netlify con x-api-key
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=False,   # no usamos cookies; mejor false para evitar restricciones
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
+
+# 👇 NUEVO: handler explícito para cualquier preflight OPTIONS (evita 404 en proxies)
+@app.options("/{full_path:path}")
+async def any_options(full_path: str, request: Request):
+    return Response(status_code=204)
 
 # =========================
 # Modelos
