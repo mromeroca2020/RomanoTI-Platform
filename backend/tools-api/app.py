@@ -2,17 +2,21 @@ from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from jose import jwt, JWTError
+from jose import jwt
 from passlib.context import CryptContext
-import ssl
-from dns import resolver, exception as dns_exc  # pip install dnspython
-import os, json, time, socket, platform, subprocess, psutil
+
+import os, json, socket, platform, subprocess, psutil, ssl
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# 👇 NUEVO: para responder OPTIONS 204 explícitamente
+# DNS / HTTP stdlib
+from dns import resolver, exception as dns_exc  # pip install dnspython
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+# Respuesta para OPTIONS
 from starlette.responses import Response
 
 # =========================
@@ -22,7 +26,6 @@ JWT_SECRET = os.getenv("ROMANOTI_JWT_SECRET", "change-me")  # ⚠️ cámbialo e
 JWT_ALG    = "HS256"
 JWT_HOURS  = int(os.getenv("ROMANOTI_JWT_HOURS", "8"))
 
-# CORS
 def _parse_origins(val: str) -> List[str]:
     try:
         j = json.loads(val)
@@ -36,7 +39,6 @@ def _parse_origins(val: str) -> List[str]:
 
 ALLOWED_ORIGINS = _parse_origins(os.getenv("ROMANOTI_ALLOWED_ORIGINS", "*"))
 
-# Paths
 PWD        = Path(__file__).resolve().parent
 USERS_FILE = PWD / "users.json"
 
@@ -46,26 +48,23 @@ REPORTS_FILE = DATA_DIR / "reports.jsonl"
 LATEST_FILE  = DATA_DIR / "latest.json"
 ORG_API_KEY  = os.getenv("ROMANOTI_ORG_API_KEY", "MySecret123$")
 
-# Crypto
+# SOC data
+SOC_ALERTS_FILE = DATA_DIR / "soc_alerts.jsonl"
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# =========================
-# App
-# =========================
-app = FastAPI(title="RomanoTI Tools API", version="1.0.0")
+app = FastAPI(title="RomanoTI Tools API", version="1.2.0")
 
-# 👇 AJUSTADO: CORS permisivo para llamadas desde Netlify con x-api-key
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,   # no usamos cookies; mejor false para evitar restricciones
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
 )
 
-# 👇 NUEVO: handler explícito para cualquier preflight OPTIONS (evita 404 en proxies)
 @app.options("/{full_path:path}")
 async def any_options(full_path: str, request: Request):
     return Response(status_code=204)
@@ -95,30 +94,45 @@ class PortScanRequest(BaseModel):
     ports: Optional[List[int]] = None
     timeout_ms: int = 500
 
+# NOC checks
+class HttpCheck(BaseModel):
+    url: str
+    timeout_s: int = 6
+    verify_tls: bool = True
+
+class TcpCheck(BaseModel):
+    host: str
+    port: int
+    timeout_ms: int = 800
+
+class DnsCheck(BaseModel):
+    domain: str
+    rtype: str = "A"  # A, AAAA, MX, TXT, CNAME, NS
+
+class IcmpCheck(BaseModel):
+    host: str
+    count: int = 2
+
+# SOC ingest
+class SocLog(BaseModel):
+    source: str = "unknown"
+    event_type: str = "generic"
+    severity: str = "info"  # info|low|medium|high|critical
+    message: str = ""
+    meta: Optional[Dict[str, Any]] = None
+
 # =========================
-# Utilidades de usuarios
+# Usuarios / Auth
 # =========================
 def load_users() -> Dict[str, Dict[str, Any]]:
-    """
-    Estructura esperada en users.json:
-    {
-      "users": [
-        {"username": "eng1", "password": "$2b$....", "roles": ["engineer"] }
-      ]
-    }
-    - Si 'password' NO es hash bcrypt, se compara en claro (útil para pruebas).
-    """
     if not USERS_FILE.exists():
-        # fallback mínimo: eng1 / eng1
         return {"users": [{"username": "eng1", "password": "eng1", "roles": ["engineer"]}]}
     with USERS_FILE.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 def verify_password(plain: str, stored: str) -> bool:
-    if stored.startswith("$2a$") or stored.startswith("$2b$") or stored.startswith("$2y$"):
-        # bcrypt
+    if stored.startswith(("$2a$", "$2b$", "$2y$")):
         return pwd_context.verify(plain, stored)
-    # texto plano (solo dev)
     return plain == stored
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -134,13 +148,6 @@ def authenticate_user(username: str, password: str) -> Optional[User]:
             return User(username=username, roles=u.get("roles") or [])
     return None
 
-def get_current_user(token: str = Depends(OAuth2PasswordRequestForm)):
-    # Esto no se usa así; dejamos la dependencia abajo en /auth/token
-    pass
-
-# =========================
-# Endpoints de Auth
-# =========================
 @app.post("/auth/token", response_model=Token)
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(form_data.username, form_data.password)
@@ -149,84 +156,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     token = create_access_token({"sub": user.username, "roles": user.roles})
     return {"access_token": token, "token_type": "bearer"}
 
-# ===== External checks =====
-class TlsReq(BaseModel):
-    host: str
-    port: int = 443
-
-class EmailDNSReq(BaseModel):
-    domain: str
-
-def _tls_cert_expiry(host: str, port: int = 443, timeout: int = 5):
-    ctx = ssl.create_default_context()
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-            cert = ssock.getpeercert()
-            # 'notAfter' ej: 'Oct 12 23:59:59 2025 GMT'
-            exp_str = cert["notAfter"]
-            exp = datetime.strptime(exp_str, "%b %d %H:%M:%S %Y %Z")
-            days = (exp - datetime.utcnow()).days
-            issuer = ""
-            try:
-                issuer = dict(x[0] for x in cert.get("issuer", [])) \
-                           .get("organizationName", "")
-            except Exception:
-                pass
-            subject = ""
-            try:
-                subject = dict(x[0] for x in cert.get("subject", [])) \
-                           .get("commonName", "")
-            except Exception:
-                pass
-            return {
-                "host": host,
-                "port": port,
-                "subject": subject,
-                "issuer": issuer,
-                "not_after": exp.isoformat() + "Z",
-                "days_remaining": days,
-            }
-
-@app.post("/ext/tls")
-def ext_tls(req: TlsReq):
-    try:
-        return _tls_cert_expiry(req.host, req.port)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/ext/emaildns")
-def email_dns(req: EmailDNSReq):
-    dom = req.domain.strip()
-    if not dom:
-        raise HTTPException(status_code=400, detail="domain required")
-
-    out = {"domain": dom}
-
-    # MX
-    try:
-        answers = resolver.resolve(dom, "MX")
-        out["mx"] = [f"{r.preference} {r.exchange.to_text()}" for r in answers]
-    except (dns_exc.DNSException, Exception) as e:
-        out["mx_error"] = str(e)
-
-    # SPF (TXT en root con 'v=spf1')
-    try:
-        txt = [t.to_text().strip('"') for t in resolver.resolve(dom, "TXT")]
-        out["spf"] = [t for t in txt if t.lower().startswith("v=spf1")]
-    except (dns_exc.DNSException, Exception) as e:
-        out["spf_error"] = str(e)
-
-    # DMARC (TXT en _dmarc.domain con 'v=DMARC1')
-    try:
-        dmarc_txt = [
-            t.to_text().strip('"')
-            for t in resolver.resolve(f"_dmarc.{dom}", "TXT")
-        ]
-        out["dmarc"] = [t for t in dmarc_txt if t.lower().startswith("v=dmarc1")]
-    except (dns_exc.DNSException, Exception) as e:
-        out["dmarc_error"] = str(e)
-
-    return out
 # =========================
 # Salud
 # =========================
@@ -271,7 +200,7 @@ def network_info():
     return {"hostname": socket.gethostname(), "interfaces": interfaces}
 
 # =========================
-# Utilidades de red
+# Utilidades de red (backend)
 # =========================
 def _run(cmd: List[str], timeout: int = 20) -> str:
     try:
@@ -289,7 +218,6 @@ def ping(req: PingRequest):
     else:
         cmd = ["ping", "-c", str(req.count), req.host]
     out = _run(cmd, timeout=30)
-    # devolvemos último bloque para no saturar
     return {"host": req.host, "count": req.count, "output": out}
 
 @app.post("/network/traceroute")
@@ -297,7 +225,6 @@ def traceroute(req: TraceRequest):
     if platform.system().lower().startswith("win"):
         cmd = ["tracert", "-d", "-h", "20", req.host]
     else:
-        # algunos contenedores no tienen 'traceroute'; si falla, mostramos mensaje
         cmd = ["traceroute", "-n", "-m", "20", req.host]
     out = _run(cmd, timeout=60)
     return {"host": req.host, "output": out}
@@ -340,28 +267,23 @@ async def client_report(
     x_api_key: Optional[str] = Header(None),
     x_agent: Optional[str] = Header(None),
 ):
-    # 1) Auth por API key
     if not x_api_key or x_api_key != ORG_API_KEY:
         raise HTTPException(status_code=401, detail="invalid x-api-key")
 
-    # 2) JSON libre
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid JSON")
 
-    # 3) Normaliza y persiste
     record = {
         "ts": datetime.utcnow().isoformat() + "Z",
         "agent": x_agent or payload.get("agent") or "unknown",
         "data": payload,
     }
 
-    # histórico
     with REPORTS_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    # último
     with LATEST_FILE.open("w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False)
 
@@ -378,3 +300,187 @@ def client_reports_latest(x_api_key: Optional[str] = Header(None)):
     with LATEST_FILE.open("r", encoding="utf-8") as f:
         record = json.load(f)
     return record
+
+# =========================
+# EXT checks (ya tenías emaildns/tls)
+# =========================
+class TlsReq(BaseModel):
+    host: str
+    port: int = 443
+
+class EmailDNSReq(BaseModel):
+    domain: str
+
+def _tls_cert_expiry(host: str, port: int = 443, timeout: int = 5):
+    ctx = ssl.create_default_context()
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            cert = ssock.getpeercert()
+            exp_str = cert["notAfter"]
+            exp = datetime.strptime(exp_str, "%b %d %H:%M:%S %Y %Z")
+            days = (exp - datetime.utcnow()).days
+            issuer = ""
+            try:
+                issuer = dict(x[0] for x in cert.get("issuer", [])) \
+                           .get("organizationName", "")
+            except Exception:
+                pass
+            subject = ""
+            try:
+                subject = dict(x[0] for x in cert.get("subject", [])) \
+                           .get("commonName", "")
+            except Exception:
+                pass
+            return {
+                "host": host,
+                "port": port,
+                "subject": subject,
+                "issuer": issuer,
+                "not_after": exp.isoformat() + "Z",
+                "days_remaining": days,
+            }
+
+@app.post("/ext/tls")
+def ext_tls(req: TlsReq):
+    try:
+        return _tls_cert_expiry(req.host, req.port)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/ext/emaildns")
+def email_dns(req: EmailDNSReq):
+    dom = req.domain.strip()
+    if not dom:
+        raise HTTPException(status_code=400, detail="domain required")
+
+    out = {"domain": dom}
+    try:
+        answers = resolver.resolve(dom, "MX")
+        out["mx"] = [f"{r.preference} {r.exchange.to_text()}" for r in answers]
+    except (dns_exc.DNSException, Exception) as e:
+        out["mx_error"] = str(e)
+
+    try:
+        txt = [t.to_text().strip('"') for t in resolver.resolve(dom, "TXT")]
+        out["spf"] = [t for t in txt if t.lower().startswith("v=spf1")]
+    except (dns_exc.DNSException, Exception) as e:
+        out["spf_error"] = str(e)
+
+    try:
+        dmarc_txt = [
+            t.to_text().strip('"')
+            for t in resolver.resolve(f"_dmarc.{dom}", "TXT")
+        ]
+        out["dmarc"] = [t for t in dmarc_txt if t.lower().startswith("v=dmarc1")]
+    except (dns_exc.DNSException, Exception) as e:
+        out["dmarc_error"] = str(e)
+
+    return out
+
+# =========================
+# Helpers
+# =========================
+def _require_org_key(x_api_key: Optional[str]):
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+# =========================
+# NOC Quick Checks (x-api-key)
+# =========================
+@app.post("/noc/http_check")
+def noc_http_check(req: HttpCheck, x_api_key: Optional[str] = Header(None)):
+    _require_org_key(x_api_key)
+    parsed = urlparse(req.url)
+    if not parsed.scheme or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="invalid url")
+    headers = {"User-Agent": "RomanoTI-NOC/1.0"}
+    # urllib no valida TLS hostname si verify_tls=False? => si verify=false, permitimos sin cert
+    ctx = ssl.create_default_context()
+    if not req.verify_tls:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    start = datetime.utcnow()
+    try:
+        r = urlopen(Request(req.url, headers=headers), timeout=req.timeout_s, context=ctx)  # nosec - controlado
+        code = r.getcode()
+        body = r.read(256)  # primeros bytes
+        ms = int((datetime.utcnow() - start).total_seconds()*1000)
+        return {"url": req.url, "status": code, "latency_ms": ms, "snippet": body[:120].decode(errors="ignore")}
+    except Exception as e:
+        ms = int((datetime.utcnow() - start).total_seconds()*1000)
+        raise HTTPException(status_code=502, detail=f"http_check error after {ms}ms: {e}")
+
+@app.post("/noc/tcp_check")
+def noc_tcp_check(req: TcpCheck, x_api_key: Optional[str] = Header(None)):
+    _require_org_key(x_api_key)
+    to = max(0.05, req.timeout_ms/1000.0)
+    t0 = datetime.utcnow()
+    try:
+        with socket.create_connection((req.host, req.port), timeout=to):
+            ms = int((datetime.utcnow()-t0).total_seconds()*1000)
+            return {"host": req.host, "port": req.port, "reachable": True, "latency_ms": ms}
+    except Exception as e:
+        ms = int((datetime.utcnow()-t0).total_seconds()*1000)
+        return {"host": req.host, "port": req.port, "reachable": False, "error": str(e), "latency_ms": ms}
+
+@app.post("/noc/dns_check")
+def noc_dns_check(req: DnsCheck, x_api_key: Optional[str] = Header(None)):
+    _require_org_key(x_api_key)
+    rtype = req.rtype.upper()
+    try:
+        answers = resolver.resolve(req.domain, rtype)
+        values = [a.to_text() for a in answers]
+        return {"domain": req.domain, "type": rtype, "answers": values}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+@app.post("/noc/icmp_check")
+def noc_icmp_check(req: IcmpCheck, x_api_key: Optional[str] = Header(None)):
+    _require_org_key(x_api_key)
+    # Reutilizamos ping del sistema para 1-2 paquetes
+    count = max(1, min(4, req.count))
+    if platform.system().lower().startswith("win"):
+        cmd = ["ping", "-n", str(count), req.host]
+    else:
+        cmd = ["ping", "-c", str(count), req.host]
+    out = _run(cmd, timeout=20)
+    return {"host": req.host, "count": count, "output": out}
+
+# =========================
+# SOC – ingest + alerts (x-api-key)
+# =========================
+@app.post("/soc/log/ingest")
+async def soc_ingest(log: SocLog, x_api_key: Optional[str] = Header(None)):
+    _require_org_key(x_api_key)
+    rec = {
+        "ts": datetime.utcnow().isoformat()+"Z",
+        "source": log.source,
+        "event_type": log.event_type,
+        "severity": log.severity,
+        "message": log.message,
+        "meta": log.meta or {}
+    }
+    sev = (log.severity or "info").lower()
+    is_alert = sev in ("high", "critical")
+
+    # Persist alert if needed
+    if is_alert:
+        with SOC_ALERTS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    return {"accepted": True, "alerted": is_alert}
+
+@app.get("/soc/alerts")
+def soc_alerts(limit: int = 50, x_api_key: Optional[str] = Header(None)):
+    _require_org_key(x_api_key)
+    if not SOC_ALERTS_FILE.exists():
+        return {"alerts": []}
+    alerts: List[Dict[str, Any]] = []
+    with SOC_ALERTS_FILE.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                alerts.append(json.loads(line))
+            except Exception:
+                continue
+    alerts = list(reversed(alerts))[:max(1, min(200, limit))]
+    return {"alerts": alerts}
