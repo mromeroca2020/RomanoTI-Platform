@@ -14,7 +14,7 @@ from pathlib import Path
 # DNS / HTTP stdlib
 from dns import resolver, exception as dns_exc  # pip install dnspython
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request as UrlRequest, urlopen
 
 # Respuesta para OPTIONS
 from starlette.responses import Response
