@@ -278,7 +278,7 @@ def client_reports_latest(x_api_key: Optional[str] = Header(None)):
     return record
 
 # =========================
-# NOC Endpoints (NUEVOS)
+# NOC Endpoints (HTTP / DNS)
 # =========================
 class HttpCheckReq(BaseModel):
     url: str
@@ -367,3 +367,61 @@ def noc_dns_lookup(req: DnsLookupReq, x_api_key: Optional[str] = Header(None)):
         return out
     except (dns_exc.DNSException, Exception) as e:
         raise HTTPException(status_code=400, detail=f"dns error: {e}")
+
+# =========================
+# NOC Endpoint (NUEVO): TCP Port Check
+# =========================
+class TcpCheckReq(BaseModel):
+    host: str
+    port: int
+    timeout_s: int = 5
+
+@app.post("/noc/tcp-check")
+def noc_tcp_check(req: TcpCheckReq, x_api_key: Optional[str] = Header(None)):
+    """
+    Verifica si un puerto TCP está accesible y mide latencia.
+    Devuelve: ok, host, port, latency_ms y (si hay) un pequeño banner del servicio.
+    Protegido por x-api-key.
+    """
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    host = req.host.strip()
+    port = int(req.port)
+    timeout = max(1, int(req.timeout_s))
+
+    # IP resuelta (mejor esfuerzo)
+    resolved_ip = None
+    try:
+        resolved_ip = socket.gethostbyname(host)
+    except Exception:
+        pass
+
+    t0 = time.perf_counter()
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(0.5)  # lectura rápida opcional
+            banner = b""
+            try:
+                banner = s.recv(64)  # algunos servicios envían banner inicial
+            except Exception:
+                pass
+            latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+            return {
+                "ok": True,
+                "host": host,
+                "port": port,
+                "resolved_ip": resolved_ip,
+                "latency_ms": latency_ms,
+                "banner": banner.decode("latin1", errors="ignore") if banner else ""
+            }
+    except Exception as e:
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+        return {
+            "ok": False,
+            "host": host,
+            "port": port,
+            "resolved_ip": resolved_ip,
+            "latency_ms": latency_ms,
+            "error": str(e)
+        }
