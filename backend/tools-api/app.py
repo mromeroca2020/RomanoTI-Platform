@@ -425,3 +425,101 @@ def noc_tcp_check(req: TcpCheckReq, x_api_key: Optional[str] = Header(None)):
             "latency_ms": latency_ms,
             "error": str(e)
         }
+        # =========================
+# SOC Endpoints (NEW)
+# =========================
+
+# Archivo donde guardaremos alertas de demo
+SOC_ALERTS_FILE = DATA_DIR / "soc_alerts.jsonl"
+
+class SocAlertIn(BaseModel):
+    source: str                  # ej: "edr", "wazuh", "firewall"
+    severity: str                # "low" | "medium" | "high" | "critical"
+    title: str
+    details: Dict[str, Any] = {} # payload libre (host, user, hash, ip, etc.)
+
+@app.post("/soc/alerts")
+def soc_alerts_receive(alert: SocAlertIn, x_api_key: Optional[str] = Header(None)):
+    """
+    Recibe alertas desde agentes/EDR (mock). Protegido por x-api-key.
+    Persiste cada alerta en data/soc_alerts.jsonl (1 línea JSON por alerta).
+    """
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    record = {
+        "ts": datetime.utcnow().isoformat()+"Z",
+        "alert": alert.dict(),
+    }
+    with SOC_ALERTS_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return {"ok": True, "saved": True}
+
+def _tail_jsonl(path: Path, limit: int) -> List[Dict[str, Any]]:
+    """
+    Devuelve las últimas N líneas de un .jsonl como lista de dicts (best effort).
+    """
+    if not path.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        lines = f.readlines()[-max(1, int(limit)):]
+    for ln in lines:
+        try:
+            out.append(json.loads(ln.strip()))
+        except Exception:
+            pass
+    return out
+
+@app.get("/soc/alerts/recent")
+def soc_alerts_recent(limit: int = 50, x_api_key: Optional[str] = Header(None)):
+    """
+    Lista las últimas N alertas guardadas (para dashboard/demo). Protegido por x-api-key.
+    """
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+    return {"ok": True, "count": int(limit), "items": _tail_jsonl(SOC_ALERTS_FILE, limit)}
+
+class PlaybookRunReq(BaseModel):
+    playbook_id: str             # ej: "isolate-host" | "reset-user" | "block-ip"
+    target: Optional[str] = None # hostname, usuario o IP (según playbook)
+
+@app.post("/soc/playbooks/run")
+def soc_playbook_run(req: PlaybookRunReq, x_api_key: Optional[str] = Header(None)):
+    """
+    Ejecuta un playbook simulado y devuelve pasos/resultado (mock).
+    Ideal para botones en /it-soc.
+    """
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    steps: List[str]
+    if req.playbook_id == "isolate-host":
+        steps = [
+            "Lookup endpoint in EDR",
+            "Issue isolate command (EDR API)",
+            "Notify NOC/SOC & create ticket",
+        ]
+    elif req.playbook_id == "reset-user":
+        steps = [
+            "Disable user sign-in (IdP)",
+            "Force password reset",
+            "Revoke refresh tokens / sessions",
+        ]
+    elif req.playbook_id == "block-ip":
+        steps = [
+            "Push IP to firewall blocklist",
+            "Validate deny rule propagation",
+        ]
+    else:
+        steps = ["Unknown playbook — no-op"]
+
+    return {
+        "ok": True,
+        "playbook": req.playbook_id,
+        "target": req.target,
+        "steps": steps,
+        "executed_at": datetime.utcnow().isoformat()+"Z",
+        "result": "simulated-success"
+    }
+
