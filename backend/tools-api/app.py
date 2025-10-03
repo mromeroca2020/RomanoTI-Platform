@@ -522,4 +522,119 @@ def soc_playbook_run(req: PlaybookRunReq, x_api_key: Optional[str] = Header(None
         "executed_at": datetime.utcnow().isoformat()+"Z",
         "result": "simulated-success"
     }
+# ======== SOC: Métricas y Búsqueda (añadir al final del app.py) ========
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+
+# Archivos (si ya los definiste arriba, omite estas líneas)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SOC_ALERTS_FILE = DATA_DIR / "soc_alerts.jsonl"   # donde guardas las alertas
+
+# Util para parsear ISO8601 con 'Z'
+def _parse_iso(ts: str) -> Optional[datetime]:
+    try:
+        # soporta '2025-10-01T01:23:45.123456Z' o sin microsegundos
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+# -------- Modelo de búsqueda --------
+class SocSearchQuery(BaseModel):
+    # filtros opcionales
+    severities: Optional[List[str]] = None     # ["low","medium","high","critical"]
+    sources:    Optional[List[str]] = None     # ["edr","siem","email"...]
+    query:      Optional[str] = None           # texto libre (title/details)
+    since:      Optional[str] = None           # ISO8601 (ej: "2025-10-01T00:00:00Z")
+    until:      Optional[str] = None           # ISO8601
+    limit:      int = 100                      # tope de resultados
+
+# -------- Stats rápidas en ventana (por defecto 24h) --------
+@app.get("/soc/alerts/stats")
+def soc_alerts_stats(window_h: int = 24, x_api_key: Optional[str] = Header(None)):
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    if not SOC_ALERTS_FILE.exists():
+        return {"total": 0, "by_severity": {}, "by_source": {}, "window_h": window_h}
+
+    cutoff = datetime.utcnow() - timedelta(hours=window_h)
+    total = 0
+    by_sev: Dict[str, int] = {}
+    by_src: Dict[str, int] = {}
+
+    with SOC_ALERTS_FILE.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+
+            ts = _parse_iso(rec.get("ts", ""))
+            if ts is None or ts < cutoff:
+                continue
+
+            total += 1
+            sev = (rec.get("severity") or "").lower() or "unknown"
+            src = (rec.get("source") or "").lower() or "unknown"
+            by_sev[sev] = by_sev.get(sev, 0) + 1
+            by_src[src] = by_src.get(src, 0) + 1
+
+    return {
+        "total": total,
+        "by_severity": by_sev,
+        "by_source": by_src,
+        "window_h": window_h,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+# -------- Búsqueda flexible --------
+@app.post("/soc/alerts/search")
+def soc_alerts_search(q: SocSearchQuery, x_api_key: Optional[str] = Header(None)):
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    if not SOC_ALERTS_FILE.exists():
+        return []
+
+    severities = set([s.lower() for s in (q.severities or [])])
+    sources    = set([s.lower() for s in (q.sources or [])])
+    txt        = (q.query or "").lower().strip()
+    since_dt   = _parse_iso(q.since) if q.since else None
+    until_dt   = _parse_iso(q.until) if q.until else None
+
+    out = []
+    with SOC_ALERTS_FILE.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+
+            ts = _parse_iso(rec.get("ts", ""))
+            if since_dt and (ts is None or ts < since_dt): 
+                continue
+            if until_dt and (ts is None or ts > until_dt): 
+                continue
+
+            if severities and (rec.get("severity","").lower() not in severities):
+                continue
+            if sources and (rec.get("source","").lower() not in sources):
+                continue
+
+            if txt:
+                haystack = (json.dumps(rec, ensure_ascii=False) or "").lower()
+                if txt not in haystack:
+                    continue
+
+            out.append(rec)
+            if len(out) >= max(1, min(1000, q.limit)):  # límites sanos
+                break
+
+    return out
 
