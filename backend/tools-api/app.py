@@ -637,4 +637,255 @@ def soc_alerts_search(q: SocSearchQuery, x_api_key: Optional[str] = Header(None)
                 break
 
     return out
+# =========================
+# EXT: Email & TLS posture + Field/SOC extras
+# =========================
+from pydantic import BaseModel
+import ssl
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+
+# ---------- TLS Cert check ----------
+class TLSCheckReq(BaseModel):
+    host: str
+    port: int = 443
+
+def _parse_openssl_time(s: str) -> datetime:
+    # ej: 'Oct  1 12:00:00 2027 GMT'
+    return datetime.strptime(s, "%b %d %H:%M:%S %Y %Z")
+
+@app.post("/ext/tls")
+def ext_tls(req: TLSCheckReq, x_api_key: Optional[str] = Header(None)):
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    host, port = req.host.strip(), int(req.port or 443)
+
+    # Primero intentamos verificación normal (cadena válida)
+    ctx = ssl.create_default_context()
+    verified = True
+    try:
+        with socket.create_connection((host, port), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                cert = ssock.getpeercert()
+    except Exception as e:
+        # Reintentamos sin verificación para al menos leer fechas/SAN
+        verified = False
+        ctx = ssl._create_unverified_context()
+        try:
+            with socket.create_connection((host, port), timeout=10) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                    cert = ssock.getpeercert()
+        except Exception as e2:
+            raise HTTPException(status_code=400, detail=f"tls error: {e2}")
+
+    not_after = cert.get("notAfter")
+    not_before = cert.get("notBefore")
+    san = [v for (k, v) in cert.get("subjectAltName", []) if k.lower() == "dns"]
+    issuer = ", ".join("=".join(t) for t in cert.get("issuer", [("CN","?")])[-1])
+    subject = ", ".join("=".join(t) for t in cert.get("subject", [("CN","?")])[-1])
+
+    # Days left
+    days_left = None
+    try:
+        na = _parse_openssl_time(not_after)
+        days_left = (na - datetime.utcnow()).days
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "verified_chain": verified,
+        "host": host,
+        "port": port,
+        "subject": subject,
+        "issuer": issuer,
+        "not_before": not_before,
+        "not_after": not_after,
+        "days_left": days_left,
+        "san_dns": san,
+    }
+
+# ---------- Email posture (MX / SPF / DMARC) ----------
+class EmailDNSReq(BaseModel):
+    domain: str
+
+@app.post("/ext/emaildns")
+def ext_emaildns(req: EmailDNSReq, x_api_key: Optional[str] = Header(None)):
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    dom = req.domain.strip().rstrip(".")
+
+    out: Dict[str, Any] = {"domain": dom}
+
+    def _res(rr, typ):
+        try:
+            ans = resolver.resolve(rr, typ)
+            return [r.to_text() for r in ans]
+        except Exception:
+            return []
+
+    mx = _res(dom, "MX")
+    spf_txt = [t for t in _res(dom, "TXT") if t.lower().startswith('"v=spf1') or t.lower().startswith('v=spf1')]
+    dmarc = _res(f"_dmarc.{dom}", "TXT")
+
+    dmarc_pol = None
+    if dmarc:
+        try:
+            txt = dmarc[0].strip('"').lower()
+            import re
+            m = re.search(r"p=(none|quarantine|reject)", txt)
+            if m:
+                dmarc_pol = m.group(1)
+        except Exception:
+            pass
+
+    out.update({
+        "mx": mx,
+        "spf": spf_txt,
+        "dmarc": dmarc,
+        "summary": {
+            "has_mx": len(mx) > 0,
+            "has_spf": any(s.lower().startswith(('"v=spf1', 'v=spf1')) for s in spf_txt),
+            "dmarc_policy": dmarc_pol or "missing",
+        }
+    })
+    return out
+
+# ---------- Service Check (agregador rápido para demos) ----------
+class ServiceCheckReq(BaseModel):
+    host: Optional[str] = None           # p.ej. 8.8.8.8
+    url: Optional[str] = None            # p.ej. https://example.com
+    ports: Optional[List[int]] = [22, 80, 443, 3389, 445, 25, 587]
+    ping_count: int = 2
+    timeout_ms: int = 500
+    verify_tls: bool = True
+
+@app.post("/noc/service-check")
+def noc_service_check(req: ServiceCheckReq, x_api_key: Optional[str] = Header(None)):
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    result: Dict[str, Any] = {"ok": True, "ts": datetime.utcnow().isoformat()+"Z", "host": req.host, "url": req.url}
+
+    # Ping
+    if req.host:
+        try:
+            if platform.system().lower().startswith("win"):
+                cmd = ["ping", "-n", str(req.ping_count), req.host]
+            else:
+                cmd = ["ping", "-c", str(req.ping_count), req.host]
+            out = _run(cmd, timeout=20)
+            result["ping"] = {"ok": True, "output": out}
+        except Exception as e:
+            result["ping"] = {"ok": False, "error": str(e)}
+
+    # Port quick scan
+    if req.host and req.ports:
+        try:
+            open_ports: List[int] = []
+            timeout = max(0.05, req.timeout_ms / 1000.0)
+            with ThreadPoolExecutor(max_workers=min(100, len(req.ports))) as ex:
+                futures = {ex.submit(_check_port, req.host, p, timeout): p for p in req.ports}
+                for fu in as_completed(futures):
+                    r = fu.result()
+                    if r:
+                        open_ports.append(r)
+            result["ports"] = {"scanned": req.ports, "open": sorted(open_ports)}
+        except Exception as e:
+            result["ports"] = {"error": str(e)}
+
+    # HTTP/TLS check
+    if req.url:
+        try:
+            u = urlparse(req.url)
+            if u.scheme not in ("http", "https"):
+                raise ValueError("url must start with http:// or https://")
+            t0 = time.time()
+            r = requests.get(req.url, timeout=8, verify=req.verify_tls, allow_redirects=True, headers={"User-Agent":"Romanoti-NOC/1.0"})
+            elapsed_ms = int((time.time()-t0)*1000)
+            keep = {"server","content-type","content-length","date","cache-control"}
+            result["http"] = {
+                "status": r.status_code,
+                "elapsed_ms": elapsed_ms,
+                "final_url": r.url,
+                "headers": {k:v for k,v in r.headers.items() if k.lower() in keep},
+                "bytes": len(r.content),
+            }
+        except Exception as e:
+            result["http"] = {"error": str(e)}
+
+    return result
+
+# ---------- SOC Telemetry ingest (demo) ----------
+@app.post("/soc/telemetry/ingest")
+def soc_telemetry_ingest(payload: Dict[str, Any], x_api_key: Optional[str] = Header(None)):
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    # Guardamos el evento para demo/corr
+    ev = {"ts": datetime.utcnow().isoformat()+"Z", **payload}
+    with (DATA_DIR / "soc_events.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+    # Reglas muy simples para demo (si coincide, creamos alerta)
+    # 1) powershell sospechoso
+    cmd = (payload.get("process_cmdline") or "").lower()
+    if "powershell" in cmd and ("downloadstring" in cmd or "encodedcommand" in cmd):
+        _ = _soc_save_alert({
+            "source": "edr",
+            "severity": "high",
+            "title": "Suspicious PowerShell",
+            "details": {"cmd": payload.get("process_cmdline"), "host": payload.get("host")}
+        })
+
+    # 2) demasiados fallos de login
+    if payload.get("event") == "auth_fail" and int(payload.get("count", 0)) >= 5:
+        _ = _soc_save_alert({
+            "source": "auth",
+            "severity": "medium",
+            "title": "Multiple login failures",
+            "details": {"user": payload.get("user"), "src": payload.get("src_ip")}
+        })
+
+    return {"ok": True}
+
+# Helper: reutiliza el mismo “save” que uses en /soc/alerts
+def _soc_save_alert(alert: Dict[str, Any]) -> Dict[str, Any]:
+    rec = {"ts": datetime.utcnow().isoformat()+"Z", **alert}
+    with (DATA_DIR / "soc_alerts.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return rec
+
+# ---------- Playbooks: preview ----------
+class PlaybookReq(BaseModel):
+    playbook_id: str
+
+@app.post("/soc/playbooks/preview")
+def soc_playbook_preview(req: PlaybookReq, x_api_key: Optional[str] = Header(None)):
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    catalog = {
+        "isolate-host": [
+            "Lookup endpoint in EDR",
+            "Issue isolate command (EDR API)",
+            "Notify NOC/SOC & create ticket"
+        ],
+        "block-ip": [
+            "Push temp firewall rule to edge",
+            "Validate no false positives",
+            "Schedule rule cleanup"
+        ],
+        "reset-user": [
+            "Force sign-out in IdP",
+            "Reset password & revoke tokens",
+            "Notify user and document"
+        ]
+    }
+    steps = catalog.get(req.playbook_id)
+    if not steps:
+        raise HTTPException(status_code=400, detail="unknown playbook_id")
+    return {"ok": True, "playbook": req.playbook_id, "steps": steps}
 
