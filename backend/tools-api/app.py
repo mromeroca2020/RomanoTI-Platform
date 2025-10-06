@@ -888,4 +888,249 @@ def soc_playbook_preview(req: PlaybookReq, x_api_key: Optional[str] = Header(Non
     if not steps:
         raise HTTPException(status_code=400, detail="unknown playbook_id")
     return {"ok": True, "playbook": req.playbook_id, "steps": steps}
+# =========================
+# EASM Lite (External Attack Surface Monitor)
+# =========================
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+import ssl, ipaddress
+
+class EasmScanReq(BaseModel):
+    domain: str
+    # subdominios sugeridos (puedes sobreescribir desde el body)
+    subdomains: Optional[List[str]] = None
+    # puertos a probar con TCP connect (rápido, respetuoso)
+    check_ports: Optional[List[int]] = [80, 443, 22, 3389, 445, 25, 110, 143, 587, 993, 995]
+    timeout_ms: int = 500
+    tls_port: int = 443
+    verify_tls: bool = True  # sólo afecta a la sonda HTTP si en el futuro la agregas
+
+def _is_private_ip(ip: str) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+    except Exception:
+        return False
+
+def _dns_list(rr: str, typ: str) -> List[str]:
+    try:
+        ans = resolver.resolve(rr, typ)
+        out = []
+        for r in ans:
+            try:
+                out.append(r.to_text())
+            except Exception:
+                out.append(str(r))
+        return out
+    except Exception:
+        return []
+
+def _tls_probe_quick(host: str, port: int) -> Dict[str, Any]:
+    """
+    Handshake TLS para extraer fechas/SAN/issuer/subject, con reintento no verificado
+    para al menos leer el cert aunque la cadena esté mala. No descarga contenido.
+    """
+    if not host:
+        return {"ok": False, "error": "no host"}
+
+    def _do_handshake(verify: bool):
+        ctx = ssl.create_default_context() if verify else ssl._create_unverified_context()
+        with socket.create_connection((host, port), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                return ssock.getpeercert()
+
+    verified = True
+    try:
+        cert = _do_handshake(True)
+    except Exception:
+        verified = False
+        try:
+            cert = _do_handshake(False)
+        except Exception as e2:
+            return {"ok": False, "error": f"tls error: {e2}"}
+
+    not_after = cert.get("notAfter")
+    not_before = cert.get("notBefore")
+    san = [v for (k, v) in cert.get("subjectAltName", []) if k.lower() == "dns"]
+    issuer = ", ".join("=".join(t) for t in cert.get("issuer", [("CN","?")])[-1])
+    subject = ", ".join("=".join(t) for t in cert.get("subject", [("CN","?")])[-1])
+
+    days_left = None
+    try:
+        # formato típico 'Oct  1 12:00:00 2027 GMT'
+        dt = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+        days_left = (dt - datetime.utcnow()).days
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "verified_chain": verified,
+        "subject": subject,
+        "issuer": issuer,
+        "not_before": not_before,
+        "not_after": not_after,
+        "days_left": days_left,
+        "san_dns": san,
+        "port": port,
+        "host": host,
+    }
+
+def _email_posture(domain: str) -> Dict[str, Any]:
+    # similar a /ext/emaildns pero local para no invocar rutas
+    dom = domain.strip().rstrip(".")
+    out: Dict[str, Any] = {"domain": dom}
+
+    mx = _dns_list(dom, "MX")
+    txt = _dns_list(dom, "TXT")
+    spf = [t for t in txt if t.lower().startswith('"v=spf1') or t.lower().startswith('v=spf1')]
+    dmarc = _dns_list(f"_dmarc.{dom}", "TXT")
+
+    pol = "missing"
+    if dmarc:
+        try:
+            low = dmarc[0].strip('"').lower()
+            import re
+            m = re.search(r"p=(none|quarantine|reject)", low)
+            if m: pol = m.group(1)
+        except Exception:
+            pass
+
+    out.update({
+        "mx": mx,
+        "spf": spf,
+        "dmarc": dmarc,
+        "summary": {
+            "has_mx": len(mx) > 0,
+            "has_spf": len(spf) > 0,
+            "dmarc_policy": pol
+        }
+    })
+    return out
+
+@app.post("/easm/scan")
+def easm_scan(req: EasmScanReq, x_api_key: Optional[str] = Header(None)):
+    """
+    EASM Lite:
+      - DNS básicos (A/AAAA/MX/NS/TXT)
+      - Postura de correo (SPF/DMARC)
+      - TLS probe (expiración/emisor/SAN)
+      - Descubrimiento corto de subdominios + ports
+      - Findings + risk_score (0–100; 100 es mejor)
+    Protegido por x-api-key.
+    """
+    if not x_api_key or x_api_key != ORG_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid x-api-key")
+
+    domain = req.domain.strip().rstrip(".")
+    if not domain:
+        raise HTTPException(status_code=400, detail="domain required")
+
+    # Subdominios default "seguros"
+    subs = req.subdomains or [
+        "www","mail","vpn","remote","portal","autodiscover","owa",
+        "api","app","dev","staging","secure","git","jira","rdp","citrix"
+    ]
+    ports = list(dict.fromkeys(int(p) for p in (req.check_ports or [])))[:30]  # límite sano
+
+    # DNS básicos
+    dns_data = {
+        "A": _dns_list(domain, "A"),
+        "AAAA": _dns_list(domain, "AAAA"),
+        "MX": _dns_list(domain, "MX"),
+        "NS": _dns_list(domain, "NS"),
+        "TXT": _dns_list(domain, "TXT"),
+    }
+
+    # Postura de correo
+    email = _email_posture(domain)
+
+    # TLS principal
+    tls_info = _tls_probe_quick(domain, int(req.tls_port))
+
+    # Descubrimiento + ports
+    timeout = max(0.05, req.timeout_ms / 1000.0)
+    sub_results: List[Dict[str, Any]] = []
+
+    # Resolver subdominios (A)
+    for s in subs:
+        fqdn = f"{s}.{domain}"
+        ips = _dns_list(fqdn, "A")
+        if not ips:
+            continue
+
+        # Chequeo de puertos para el primer IP/hostname (rápido)
+        open_ports: List[int] = []
+        try:
+            with ThreadPoolExecutor(max_workers=min(60, len(ports))) as ex:
+                futs = {ex.submit(_check_port, fqdn, p, timeout): p for p in ports}
+                for fu in as_completed(futs):
+                    r = fu.result()
+                    if r: open_ports.append(r)
+        except Exception:
+            pass
+
+        sub_results.append({
+            "host": fqdn,
+            "ips": ips,
+            "has_private_ip": any(_is_private_ip(ip) for ip in ips),
+            "open_ports": sorted(open_ports),
+        })
+
+    # Findings & scoring
+    findings: List[Dict[str, Any]] = []
+    risk = 100  # base
+
+    # Email posture findings
+    if not email["summary"]["has_spf"]:
+        findings.append({"sev": "medium", "id": "spf_missing", "msg": "SPF ausente"})
+        risk -= 10
+    pol = email["summary"]["dmarc_policy"]
+    if pol == "missing" or pol == "none":
+        findings.append({"sev": "medium", "id": "dmarc_weak", "msg": f"DMARC {pol}"})
+        risk -= 10
+    if email["mx"] and ('0 .' in [m.strip().lower() for m in email["mx"]]):
+        findings.append({"sev": "low", "id": "null_mx", "msg": "Null MX detectado"})
+
+    # TLS findings
+    if tls_info.get("ok"):
+        days_left = tls_info.get("days_left")
+        if isinstance(days_left, int):
+            if days_left < 7:
+                findings.append({"sev": "high", "id": "tls_expiring", "msg": f"Certificado expira en {days_left} días"})
+                risk -= 25
+            elif days_left < 30:
+                findings.append({"sev": "medium", "id": "tls_expiring_soon", "msg": f"Certificado expira en {days_left} días"})
+                risk -= 10
+    else:
+        findings.append({"sev": "medium", "id": "tls_probe_failed", "msg": f"No se pudo leer TLS: {tls_info.get('error')}"})
+        risk -= 5
+
+    # Puertos “sensibles” expuestos
+    risky_map = {3389: ("high","RDP abierto"), 445: ("high","SMB expuesto"), 22: ("medium","SSH expuesto")}
+    for sub in sub_results:
+        for p in sub.get("open_ports", []):
+            if p in risky_map:
+                sev, label = risky_map[p]
+                findings.append({"sev": sev, "id": f"port_{p}", "host": sub["host"], "msg": label})
+                risk -= (20 if sev == "high" else 10)
+
+        if sub.get("has_private_ip"):
+            findings.append({"sev":"low","id":"private_ip_dns","host":sub["host"],"msg":"Respuesta A hacia IP privada (posible filtración)"})
+            risk -= 3
+
+    # Normaliza score
+    risk = max(0, min(100, risk))
+
+    return {
+        "ok": True,
+        "ts": datetime.utcnow().isoformat()+"Z",
+        "domain": domain,
+        "dns": dns_data,
+        "email_posture": email,
+        "tls": tls_info,
+        "subdomains": sub_results,
+        "findings": findings,
+        "risk_score": risk
+    }
 
